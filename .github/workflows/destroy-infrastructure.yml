@@ -1,0 +1,147 @@
+name: "Destroy Infrastructure"
+
+"on":
+  workflow_dispatch:
+    inputs:
+      confirmation:
+        description: "Type 'destroy' to confirm"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  destroy:
+    name: "Destroy Infrastructure"
+    runs-on: ubuntu-latest
+    if: ${{ github.event.inputs.confirmation == 'destroy' }}
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v3
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: us-east-2
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v2
+        with:
+          terraform_version: "1.7.0"
+
+      - name: Destroy EKS Resources
+        run: |
+          CLUSTER_NAME="vanillatstodo-cluster"
+
+          # Check if cluster exists first
+          echo "🔍 Checking if EKS cluster exists..."
+          if aws eks describe-cluster --name $CLUSTER_NAME >/dev/null 2>&1; then
+            echo "✅ Found EKS cluster: $CLUSTER_NAME"
+
+            # Add required EKS permissions
+            aws iam attach-role-policy \
+              --role-name vanillatstodo-deployer \
+              --policy-arn arn:aws:iam::aws:policy/AmazonEKSClusterPolicy
+
+            echo "🔍 Checking for EKS node groups..."
+            NODE_GROUPS=$(aws eks list-nodegroups --cluster-name $CLUSTER_NAME --query 'nodegroups[*]' --output text || echo "")
+
+            if [ ! -z "$NODE_GROUPS" ]; then
+              echo "Found node groups: $NODE_GROUPS"
+              for ng in $NODE_GROUPS; do
+                echo "🗑️ Deleting node group: $ng"
+                aws eks delete-nodegroup --cluster-name $CLUSTER_NAME --nodegroup-name $ng
+                echo "⏳ Waiting for node group deletion..."
+                aws eks wait nodegroup-deleted --cluster-name $CLUSTER_NAME --nodegroup-name $ng
+              done
+            fi
+
+            echo "🗑️ Deleting EKS cluster..."
+            aws eks delete-cluster --name $CLUSTER_NAME
+            echo "⏳ Waiting for cluster deletion..."
+            aws eks wait cluster-deleted --name $CLUSTER_NAME
+          else
+            echo "ℹ️ EKS cluster does not exist, skipping..."
+          fi
+
+      - name: Clean Up Network Resources
+        run: |
+          echo "🔍 Finding VPC resources..."
+          VPC_ID=$(aws ec2 describe-vpcs --filters "Name=tag:Name,Values=*vanillatstodo*" --query 'Vpcs[0].VpcId' --output text)
+
+          if [ "$VPC_ID" != "None" ]; then
+            echo "Found VPC: $VPC_ID"
+            
+            # List all dependencies for debugging
+            echo "📋 Listing VPC Dependencies..."
+            aws ec2 describe-vpc-attribute --vpc-id $VPC_ID --attribute enableDnsSupport
+            aws ec2 describe-vpc-peering-connections --filters "Name=requester-vpc-info.vpc-id,Values=$VPC_ID"
+            aws ec2 describe-vpc-endpoints --filters "Name=vpc-id,Values=$VPC_ID"
+
+            # Force detach and delete ENIs
+            echo "🔍 Finding Network Interfaces..."
+            ENI_IDS=$(aws ec2 describe-network-interfaces --filters "Name=vpc-id,Values=$VPC_ID" --query 'NetworkInterfaces[*].NetworkInterfaceId' --output text)
+            for eni in $ENI_IDS; do
+              echo "Processing ENI: $eni"
+              ATTACHMENT_ID=$(aws ec2 describe-network-interfaces --network-interface-ids $eni --query 'NetworkInterfaces[0].Attachment.AttachmentId' --output text)
+              if [ "$ATTACHMENT_ID" != "None" ]; then
+                echo "🔄 Force detaching ENI: $eni"
+                aws ec2 detach-network-interface --attachment-id $ATTACHMENT_ID --force
+                sleep 15  # Wait for detachment
+              fi
+              echo "🗑️ Deleting ENI: $eni"
+              aws ec2 delete-network-interface --network-interface-id $eni || true
+            done
+
+            # Delete Security Group Rules First
+            echo "🔍 Finding Security Groups..."
+            SG_IDS=$(aws ec2 describe-security-groups --filters "Name=vpc-id,Values=$VPC_ID" --query 'SecurityGroups[?GroupName!=`default`].GroupId' --output text)
+            for sg in $SG_IDS; do
+              echo "🗑️ Removing inbound rules from SG: $sg"
+              aws ec2 revoke-security-group-ingress --group-id $sg --protocol all --source-group $sg --port -1 || true
+              echo "🗑️ Removing outbound rules from SG: $sg"
+              aws ec2 revoke-security-group-egress --group-id $sg --protocol all --port -1 --cidr 0.0.0.0/0 || true
+              echo "🗑️ Deleting Security Group: $sg"
+              aws ec2 delete-security-group --group-id $sg || true
+            done
+
+            # Delete Route Tables (except main)
+            echo "🔍 Finding Route Tables..."
+            RT_IDS=$(aws ec2 describe-route-tables --filters "Name=vpc-id,Values=$VPC_ID" --query 'RouteTables[?Associations[0].Main!=`true`].RouteTableId' --output text)
+            for rt in $RT_IDS; do
+              # Delete routes first
+              echo "🗑️ Deleting routes from RT: $rt"
+              ROUTES=$(aws ec2 describe-route-tables --route-table-id $rt --query 'RouteTables[0].Routes[?GatewayId!=`local`].DestinationCidrBlock' --output text)
+              for route in $ROUTES; do
+                aws ec2 delete-route --route-table-id $rt --destination-cidr-block $route || true
+              done
+              
+              # Then disassociate
+              ASSOC_IDS=$(aws ec2 describe-route-tables --route-table-id $rt --query 'RouteTables[0].Associations[*].RouteTableAssociationId' --output text)
+              for assoc in $ASSOC_IDS; do
+                echo "🔄 Disassociating route table: $assoc"
+                aws ec2 disassociate-route-table --association-id $assoc || true
+              done
+              
+              echo "🗑️ Deleting Route Table: $rt"
+              aws ec2 delete-route-table --route-table-id $rt || true
+            done
+
+            # Delete Subnets
+            echo "🔍 Finding Subnets..."
+            SUBNET_IDS=$(aws ec2 describe-subnets --filters "Name=vpc-id,Values=$VPC_ID" --query 'Subnets[*].SubnetId' --output text)
+            for subnet in $SUBNET_IDS; do
+              echo "🗑️ Deleting subnet: $subnet"
+              aws ec2 delete-subnet --subnet-id $subnet || true
+            done
+
+            # Final VPC deletion attempt
+            echo "🗑️ Attempting VPC deletion..."
+            sleep 30  # Wait for all deletions to complete
+            aws ec2 delete-vpc --vpc-id $VPC_ID
+          fi
