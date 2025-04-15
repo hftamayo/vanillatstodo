@@ -1,11 +1,20 @@
+# Main state bucket
 resource "aws_s3_bucket" "terraform_state" {
-  bucket = "vanillatstodo-terraform-state"
+  bucket = local.bucket_name
 
   lifecycle {
     prevent_destroy = true
   }
+
+  tags = {
+    Name        = "${var.environment}-terraform-state"
+    Environment = var.environment
+    Layer       = "state"
+    ManagedBy   = "terraform"
+  }
 }
 
+# Enable versioning
 resource "aws_s3_bucket_versioning" "terraform_state" {
   bucket = aws_s3_bucket.terraform_state.id
   versioning_configuration {
@@ -13,6 +22,7 @@ resource "aws_s3_bucket_versioning" "terraform_state" {
   }
 }
 
+# Block public access
 resource "aws_s3_bucket_public_access_block" "terraform_state" {
   bucket = aws_s3_bucket.terraform_state.id
 
@@ -22,17 +32,14 @@ resource "aws_s3_bucket_public_access_block" "terraform_state" {
   restrict_public_buckets = true
 }
 
-resource "aws_dynamodb_table" "terraform_state_lock" {
-  name         = "vanillatstodo-terraform-state-lock"
-  billing_mode = "PAY_PER_REQUEST"
-  hash_key     = "LockID"
+# Enable encryption
+resource "aws_s3_bucket_server_side_encryption_configuration" "terraform_state" {
+  bucket = aws_s3_bucket.terraform_state.id
 
-  attribute {
-    name = "LockID"
-    type = "S"
-  }
-
-  lifecycle {
-    prevent_destroy = true
+  rule {
+    apply_server_side_encryption_by_default {
+      sse_algorithm = "AES256"
+    }
+    bucket_key_enabled = true
   }
 }

@@ -1,5 +1,5 @@
 variable "environment" {
-  description = "Environment name for the infrastructure (staging or production)"
+  description = "Environment name for the infrastructure"
   type        = string
   default     = "staging"
 
@@ -49,15 +49,4 @@ variable "enable_dns" {
   description = "Enable DNS support and DNS hostnames in VPC"
   type        = bool
   default     = true
-}
-
-variable "cluster_name" {
-  description = "Name of the EKS cluster"
-  type        = string
-  default     = "vanillatstodo-cluster"
-
-  validation {
-    condition     = can(regex("^[a-z0-9-]+$", var.cluster_name))
-    error_message = "Cluster name must consist of lower case alphanumeric characters and hyphens only."
-  }
 }
