@@ -3,18 +3,18 @@ terraform {
 
   backend "s3" {
     bucket         = "vanillatstodo-terraform-state"
-    key            = "ENVIRONMENT/eks/terraform.tfstate"
+    key            = "ENVIRONMENT/monitoring/terraform.tfstate"
     region         = "us-east-2"
     encrypt        = true
     use_lockfile   = true
   }
 }
 
-data "terraform_remote_state" "network" {
+data "terraform_remote_state" "eks" {
   backend = "s3"
   config = {
     bucket  = "vanillatstodo-terraform-state"
-    key     = "${var.environment}/network/terraform.tfstate"
+    key     = "${var.environment}/eks/terraform.tfstate"
     region  = "us-east-2"
     encrypt = true
   }
