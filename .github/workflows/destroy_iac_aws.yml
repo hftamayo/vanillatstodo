@@ -1,4 +1,4 @@
-name: "Destroy IaC Resources"
+name: Destroy TFIaC on AWS
 
 "on":
   workflow_dispatch:
@@ -79,15 +79,15 @@ jobs:
             -backend-config="key=${{ env.ENVIRONMENT }}/eks/terraform.tfstate" \
             -backend-config="region=${{ env.AWS_REGION }}" \
             -backend-config="encrypt=true"
-          
+
           # Check if network state exists and has outputs
           echo "🔍 Checking network state availability..."
           NETWORK_STATE_EXISTS=$(aws s3api head-object \
             --bucket ${{ env.BUCKET_NAME }} \
             --key ${{ env.ENVIRONMENT }}/network/terraform.tfstate 2>/dev/null && echo "true" || echo "false")
-          
+
           echo "📊 Network state exists: $NETWORK_STATE_EXISTS"
-          
+
           if [ "$NETWORK_STATE_EXISTS" = "false" ]; then
             echo "⚠️ Network state not found. Checking if EKS resources exist directly..."
             
@@ -161,11 +161,87 @@ jobs:
             fi
           fi
 
+      - name: Clean Kubernetes-Managed AWS Resources
+        id: k8s_resources_cleanup
+        run: |
+          echo "🧹 Cleaning Kubernetes-managed AWS resources..."
+
+          # Check if EKS cluster exists and is accessible
+          if aws eks describe-cluster --name ${{ env.CLUSTER_NAME }} >/dev/null 2>&1; then
+            echo "✅ EKS cluster found, attempting to clean Kubernetes resources..."
+            
+            # Install kubectl
+            echo "📦 Installing kubectl..."
+            curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+            chmod +x kubectl
+            sudo mv kubectl /usr/local/bin/
+            
+            # Update kubeconfig
+            echo "🔧 Configuring kubectl..."
+            aws eks update-kubeconfig --name ${{ env.CLUSTER_NAME }} --region ${{ env.AWS_REGION }}
+            
+            # Test cluster connectivity
+            if kubectl cluster-info >/dev/null 2>&1; then
+              echo "✅ Cluster connection successful"
+              
+              # 1. Delete LoadBalancer services (creates AWS LoadBalancers)
+              echo "🗑️ Deleting LoadBalancer services..."
+              LB_SERVICES=$(kubectl get services --all-namespaces --field-selector spec.type=LoadBalancer -o name 2>/dev/null || echo "")
+              if [ ! -z "$LB_SERVICES" ]; then
+                echo "   Found LoadBalancer services: $LB_SERVICES"
+                kubectl delete services --all-namespaces --field-selector spec.type=LoadBalancer --timeout=120s || true
+                echo "   ⏳ Waiting for LoadBalancers to be deleted..."
+                sleep 60
+              else
+                echo "   ℹ️ No LoadBalancer services found"
+              fi
+              
+              # 2. Delete Ingresses (may create AWS LoadBalancers/ALBs)
+              echo "🗑️ Deleting Ingresses..."
+              INGRESSES=$(kubectl get ingress --all-namespaces -o name 2>/dev/null || echo "")
+              if [ ! -z "$INGRESSES" ]; then
+                echo "   Found ingresses: $INGRESSES"
+                kubectl delete ingress --all-namespaces --timeout=120s || true
+                echo "   ⏳ Waiting for Ingress resources to be deleted..."
+                sleep 30
+              else
+                echo "   ℹ️ No Ingresses found"
+              fi
+              
+              # 3. Delete PersistentVolumes (creates AWS EBS volumes)
+              echo "🗑️ Deleting PersistentVolumeClaims..."
+              PVCS=$(kubectl get pvc --all-namespaces -o name 2>/dev/null || echo "")
+              if [ ! -z "$PVCS" ]; then
+                echo "   Found PVCs: $PVCS"
+                kubectl delete pvc --all-namespaces --timeout=120s || true
+                echo "   ⏳ Waiting for PVCs to be deleted..."
+                sleep 30
+              else
+                echo "   ℹ️ No PVCs found"
+              fi
+              
+              # 4. Delete any remaining resources in our application namespace
+              echo "🗑️ Cleaning application resources..."
+              kubectl delete deployment,service,configmap,secret,ingress -l app=vanillatstodo --timeout=60s || true
+              
+              echo "✅ Kubernetes resource cleanup completed"
+              echo "K8S_CLEANUP_STATUS=✅" >> $GITHUB_ENV
+              
+            else
+              echo "⚠️ Cannot connect to cluster, skipping Kubernetes cleanup"
+              echo "ℹ️ Resources may need manual cleanup in AWS Console"
+              echo "K8S_CLEANUP_STATUS=⚠️" >> $GITHUB_ENV
+            fi
+          else
+            echo "ℹ️ EKS cluster not found, skipping Kubernetes cleanup"
+            echo "K8S_CLEANUP_STATUS=✅" >> $GITHUB_ENV
+          fi
+
       - name: Manual EKS Cleanup (if needed)
         id: manual_eks_cleanup
         run: |
           echo "🔍 Checking for any remaining EKS resources..."
-          
+
           # Check for EKS clusters
           CLUSTERS=$(aws eks list-clusters --query "clusters[?contains(@, '${{ env.CLUSTER_NAME }}')]" --output text)
           if [ ! -z "$CLUSTERS" ] && [ "$CLUSTERS" != "None" ]; then
@@ -193,14 +269,14 @@ jobs:
           else
             echo "✅ No EKS clusters found"
           fi
-          
+
           # Check for EKS-related security groups
           echo "🔍 Checking for EKS-related security groups..."
           EKS_SGS=$(aws ec2 describe-security-groups \
             --filters "Name=group-name,Values=*eks*" "Name=tag:Project,Values=${{ env.PROJECT_NAME }}" \
             --query 'SecurityGroups[*].GroupId' \
             --output text)
-          
+
           if [ ! -z "$EKS_SGS" ] && [ "$EKS_SGS" != "None" ]; then
             echo "🗑️ Found EKS security groups: $EKS_SGS"
             for sg in $EKS_SGS; do
@@ -208,14 +284,14 @@ jobs:
               aws ec2 delete-security-group --group-id $sg || true
             done
           fi
-          
+
           # Check for EKS-related VPC endpoints
           echo "🔍 Checking for EKS-related VPC endpoints..."
           VPC_IDS=$(aws ec2 describe-vpcs \
             --filters "Name=tag:Name,Values=*vanillatstodo*" \
             --query 'Vpcs[*].VpcId' \
             --output text)
-          
+
           for VPC_ID in $VPC_IDS; do
             EKS_ENDPOINTS=$(aws ec2 describe-vpc-endpoints \
               --filters "Name=vpc-id,Values=$VPC_ID" "Name=service-name,Values=com.amazonaws.*.eks" \
@@ -237,10 +313,10 @@ jobs:
         run: |
           echo "⏳ Waiting for EKS resources to be fully deleted..."
           sleep 60
-          
+
           # Check if there are any remaining EKS-related resources
           echo "🔍 Checking for remaining EKS resources..."
-          
+
           # Check for EKS clusters
           CLUSTERS=$(aws eks list-clusters --query "clusters[?contains(@, '${{ env.CLUSTER_NAME }}')]" --output text)
           if [ ! -z "$CLUSTERS" ] && [ "$CLUSTERS" != "None" ]; then
@@ -250,7 +326,7 @@ jobs:
           else
             echo "✅ No remaining EKS clusters found"
           fi
-          
+
           # Check for EKS node groups
           NODE_GROUPS=$(aws eks list-nodegroups --cluster-name ${{ env.CLUSTER_NAME }} --query "nodegroups" --output text 2>/dev/null || echo "")
           if [ ! -z "$NODE_GROUPS" ] && [ "$NODE_GROUPS" != "None" ]; then
@@ -270,22 +346,48 @@ jobs:
             -backend-config="key=${{ env.ENVIRONMENT }}/monitoring/terraform.tfstate" \
             -backend-config="region=${{ env.AWS_REGION }}" \
             -backend-config="encrypt=true"
-          terraform destroy -auto-approve \
-            -var="aws_region=${{ env.AWS_REGION }}" \
-            -var="project_name=${{ env.PROJECT_NAME }}" \
-            -var="environment=${{ env.ENVIRONMENT }}"
+
+          # Check if EKS cluster still exists before attempting Terraform destroy
+          echo "🔍 Checking if EKS cluster exists before monitoring destruction..."
+          CLUSTER_EXISTS=$(aws eks describe-cluster \
+            --name ${{ env.CLUSTER_NAME }} \
+            --query 'cluster.name' \
+            --output text 2>/dev/null || echo "false")
+
+          echo "📊 EKS cluster exists: $CLUSTER_EXISTS"
+
+          if [ "$CLUSTER_EXISTS" = "${{ env.CLUSTER_NAME }}" ]; then
+            echo "✅ EKS cluster exists. Proceeding with normal Terraform destroy..."
+            terraform destroy -auto-approve \
+              -var="cluster_name=${{ env.CLUSTER_NAME }}" \
+              -var="aws_region=${{ env.AWS_REGION }}" \
+              -var="project_name=${{ env.PROJECT_NAME }}" \
+              -var="environment=${{ env.ENVIRONMENT }}"
+          else
+            echo "⚠️ EKS cluster not found. Using refresh=false to avoid data source errors..."
+            
+            # Try to destroy without refreshing state (skip data source validation)
+            terraform destroy -auto-approve -refresh=false \
+              -var="cluster_name=${{ env.CLUSTER_NAME }}" \
+              -var="aws_region=${{ env.AWS_REGION }}" \
+              -var="project_name=${{ env.PROJECT_NAME }}" \
+              -var="environment=${{ env.ENVIRONMENT }}" || {
+              echo "⚠️ Terraform destroy failed due to missing EKS cluster. Proceeding with manual cleanup..."
+              echo "MONITORING_TERRAFORM_FAILED=true" >> $GITHUB_ENV
+            }
+          fi
 
       - name: Enhanced Network Dependency Cleanup
         id: enhanced_network_cleanup
         run: |
           echo "🔍 Performing enhanced network dependency cleanup..."
-          
+
           # Find all VPCs with our project tags
           VPC_IDS=$(aws ec2 describe-vpcs \
             --filters "Name=tag:Name,Values=*vanillatstodo*" \
             --query 'Vpcs[*].VpcId' \
             --output text)
-          
+
           for VPC_ID in $VPC_IDS; do
             echo "🔍 Cleaning up dependencies for VPC: $VPC_ID"
             
@@ -302,7 +404,7 @@ jobs:
               sleep 30
             fi
             
-            # 2. Delete all network interfaces
+            # 2. Delete all network interfaces with proper error handling
             echo "🗑️ Deleting all network interfaces..."
             ENI_IDS=$(aws ec2 describe-network-interfaces \
               --filters "Name=vpc-id,Values=$VPC_ID" \
@@ -312,16 +414,25 @@ jobs:
             if [ ! -z "$ENI_IDS" ] && [ "$ENI_IDS" != "None" ]; then
               echo "🗑️ Found network interfaces: $ENI_IDS"
               for eni in $ENI_IDS; do
-                ENI_STATUS=$(aws ec2 describe-network-interfaces \
-                  --network-interface-ids $eni \
-                  --query 'NetworkInterfaces[0].Status' \
-                  --output text)
-                if [ "$ENI_STATUS" = "available" ]; then
-                  echo "🗑️ Deleting available network interface: $eni"
-                  aws ec2 delete-network-interface --network-interface-id $eni || true
-                  sleep 5
+                echo "🔍 Checking network interface: $eni"
+                # Check if ENI still exists
+                if aws ec2 describe-network-interfaces --network-interface-ids $eni >/dev/null 2>&1; then
+                  ENI_STATUS=$(aws ec2 describe-network-interfaces \
+                    --network-interface-ids $eni \
+                    --query 'NetworkInterfaces[0].Status' \
+                    --output text 2>/dev/null || echo "not-found")
+                  
+                  if [ "$ENI_STATUS" = "available" ]; then
+                    echo "🗑️ Deleting available network interface: $eni"
+                    aws ec2 delete-network-interface --network-interface-id $eni || true
+                    sleep 3
+                  elif [ "$ENI_STATUS" = "not-found" ]; then
+                    echo "ℹ️ Network interface $eni already deleted"
+                  else
+                    echo "⚠️ Network interface $eni is not available (status: $ENI_STATUS)"
+                  fi
                 else
-                  echo "⚠️ Network interface $eni is not available (status: $ENI_STATUS)"
+                  echo "ℹ️ Network interface $eni no longer exists (already cleaned up)"
                 fi
               done
             fi
@@ -433,9 +544,101 @@ jobs:
             
             echo "✅ Completed dependency cleanup for VPC: $VPC_ID"
           done
-          
+
           echo "⏳ Waiting for all resources to be fully deleted..."
           sleep 30
+
+      - name: Clean AWS Dependencies Before Network Destruction
+        id: aws_dependencies_cleanup
+        run: |
+          echo "🧹 Cleaning AWS dependencies that block network destruction..."
+
+          # 1. Delete Load Balancers in the VPC
+          echo "🔍 Finding Load Balancers..."
+          VPC_ID=$(aws ec2 describe-vpcs \
+            --filters "Name=tag:Project,Values=${{ env.PROJECT_NAME }}" "Name=tag:Environment,Values=${{ env.ENVIRONMENT }}" \
+            --query "Vpcs[0].VpcId" --output text 2>/dev/null || echo "None")
+
+          if [ "$VPC_ID" != "None" ] && [ "$VPC_ID" != "null" ] && [ ! -z "$VPC_ID" ]; then
+            echo "✅ Found VPC: $VPC_ID"
+            
+            # Delete Classic Load Balancers
+            echo "🗑️ Deleting Classic Load Balancers..."
+            CLASSIC_LBS=$(aws elb describe-load-balancers \
+              --query "LoadBalancerDescriptions[?VPCId=='$VPC_ID'].LoadBalancerName" \
+              --output text 2>/dev/null || echo "")
+            
+            if [ ! -z "$CLASSIC_LBS" ] && [ "$CLASSIC_LBS" != "None" ]; then
+              for lb in $CLASSIC_LBS; do
+                echo "   🗑️ Deleting Classic LB: $lb"
+                aws elb delete-load-balancer --load-balancer-name "$lb" || true
+              done
+            fi
+            
+            # Delete Application/Network Load Balancers
+            echo "🗑️ Deleting ALB/NLB Load Balancers..."
+            ALB_ARNS=$(aws elbv2 describe-load-balancers \
+              --query "LoadBalancers[?VpcId=='$VPC_ID'].LoadBalancerArn" \
+              --output text 2>/dev/null || echo "")
+            
+            if [ ! -z "$ALB_ARNS" ] && [ "$ALB_ARNS" != "None" ]; then
+              for arn in $ALB_ARNS; do
+                echo "   🗑️ Deleting ALB/NLB: $arn"
+                aws elbv2 delete-load-balancer --load-balancer-arn "$arn" || true
+              done
+            fi
+            
+            # Wait for LBs to be deleted
+            echo "⏳ Waiting for Load Balancers to be deleted..."
+            sleep 60
+            
+            # 2. Delete NAT Gateway EIPs
+            echo "🗑️ Releasing NAT Gateway Elastic IPs..."
+            EIP_ALLOCS=$(aws ec2 describe-addresses \
+              --filters "Name=domain,Values=vpc" \
+              --query "Addresses[?AssociationId!=null].AllocationId" \
+              --output text 2>/dev/null || echo "")
+            
+            if [ ! -z "$EIP_ALLOCS" ] && [ "$EIP_ALLOCS" != "None" ]; then
+              for alloc in $EIP_ALLOCS; do
+                echo "   🗑️ Releasing EIP: $alloc"
+                aws ec2 release-address --allocation-id "$alloc" || true
+              done
+            fi
+            
+            # 3. Force delete Network Interfaces
+            echo "🗑️ Deleting Network Interfaces..."
+            ENI_IDS=$(aws ec2 describe-network-interfaces \
+              --filters "Name=vpc-id,Values=$VPC_ID" "Name=status,Values=available" \
+              --query "NetworkInterfaces[].NetworkInterfaceId" \
+              --output text 2>/dev/null || echo "")
+            
+            if [ ! -z "$ENI_IDS" ] && [ "$ENI_IDS" != "None" ]; then
+              for eni in $ENI_IDS; do
+                echo "   🗑️ Deleting ENI: $eni"
+                aws ec2 delete-network-interface --network-interface-id "$eni" || true
+              done
+            fi
+            
+            # 4. Delete Security Groups (except default)
+            echo "🗑️ Deleting Security Groups..."
+            SG_IDS=$(aws ec2 describe-security-groups \
+              --filters "Name=vpc-id,Values=$VPC_ID" \
+              --query "SecurityGroups[?GroupName!='default'].GroupId" \
+              --output text 2>/dev/null || echo "")
+            
+            if [ ! -z "$SG_IDS" ] && [ "$SG_IDS" != "None" ]; then
+              for sg in $SG_IDS; do
+                echo "   🗑️ Deleting Security Group: $sg"
+                aws ec2 delete-security-group --group-id "$sg" || true
+              done
+            fi
+            
+            echo "⏳ Waiting for dependencies to clear..."
+            sleep 30
+          else
+            echo "ℹ️ No VPC found, skipping dependency cleanup"
+          fi
 
       - name: Destroy Network Resources
         id: network_cleanup
@@ -446,30 +649,99 @@ jobs:
             -backend-config="key=${{ env.ENVIRONMENT }}/network/terraform.tfstate" \
             -backend-config="region=${{ env.AWS_REGION }}" \
             -backend-config="encrypt=true"
-          
+
           # Check for and force unlock any stale locks
           echo "🔓 Checking for stale state locks..."
+
+          # Try multiple methods to get the lock ID
+          LOCK_ID=""
+
+          # Method 1: Try terraform plan to get lock info
           if terraform plan -detailed-exitcode >/dev/null 2>&1; then
             echo "✅ No state lock detected"
           else
-            echo "⚠️ State lock detected, attempting to force unlock..."
-            # Try to get the lock ID from the error message
-            LOCK_ID=$(terraform plan 2>&1 | grep -o 'ID: [a-f0-9-]*' | cut -d' ' -f2 || echo "")
-            if [ ! -z "$LOCK_ID" ]; then
-              echo "🔓 Force unlocking with ID: $LOCK_ID"
-              terraform force-unlock -force "$LOCK_ID"
-            else
-              echo "⚠️ Could not determine lock ID, trying generic unlock..."
-              # Try the lock ID from the error message
-              terraform force-unlock -force 22adec0c-b380-16f0-1453-8ae8d9bd834f || true
+            echo "⚠️ State lock detected, extracting lock ID..."
+            
+            # Method 2: Get lock ID from terraform plan error output
+            LOCK_ID=$(terraform plan 2>&1 | grep -E 'ID:\s+[a-f0-9-]+' | head -1 | sed 's/.*ID:\s*//' | tr -d ' ' || echo "")
+            
+            if [ -z "$LOCK_ID" ]; then
+              # Method 3: Try terraform init to get lock info
+              LOCK_ID=$(terraform init 2>&1 | grep -E 'ID:\s+[a-f0-9-]+' | head -1 | sed 's/.*ID:\s*//' | tr -d ' ' || echo "")
             fi
+            
+            if [ -z "$LOCK_ID" ]; then
+              # Method 4: Try from any terraform command
+              LOCK_ID=$(terraform refresh 2>&1 | grep -E 'ID:\s+[a-f0-9-]+' | head -1 | sed 's/.*ID:\s*//' | tr -d ' ' || echo "")
+            fi
+            
+            if [ ! -z "$LOCK_ID" ]; then
+              echo "🔓 Found lock ID: $LOCK_ID"
+              echo "🔓 Force unlocking..."
+              terraform force-unlock -force "$LOCK_ID" || true
+            else
+              echo "⚠️ Could not determine lock ID, trying common patterns..."
+              # Try known lock IDs from the error message
+              terraform force-unlock -force "26caec4a-58ea-883b-72d5-302b3bd9afcd" || true
+              terraform force-unlock -force "22adec0c-b380-16f0-1453-8ae8d9bd834f" || true
+            fi
+            
+            # Verify unlock worked
+            echo "🔍 Verifying state lock is cleared..."
+            sleep 5
           fi
-          
+
           echo "🚀 Proceeding with network destruction..."
-          terraform destroy -auto-approve \
-            -var="aws_region=${{ env.AWS_REGION }}" \
-            -var="project_name=${{ env.PROJECT_NAME }}" \
-            -var="environment=${{ env.ENVIRONMENT }}"
+
+          # Retry logic for network destruction
+          for attempt in 1 2 3; do
+            echo "🔄 Network destruction attempt $attempt/3..."
+            
+            # Use -lock=false on retry attempts if lock issues persist
+            LOCK_FLAG=""
+            if [ $attempt -gt 1 ]; then
+              echo "⚠️ Using -lock=false to bypass state locking on retry..."
+              LOCK_FLAG="-lock=false"
+            fi
+            
+            if terraform destroy -auto-approve $LOCK_FLAG \
+              -var="aws_region=${{ env.AWS_REGION }}" \
+              -var="project_name=${{ env.PROJECT_NAME }}" \
+              -var="environment=${{ env.ENVIRONMENT }}"; then
+              echo "✅ Network destruction successful!"
+              break
+            else
+              echo "❌ Network destruction failed on attempt $attempt"
+              
+              if [ $attempt -lt 3 ]; then
+                echo "⏳ Waiting before retry..."
+                sleep 60
+                
+                # Try to clean more dependencies
+                echo "🧹 Additional dependency cleanup..."
+                VPC_ID=$(aws ec2 describe-vpcs \
+                  --filters "Name=tag:Project,Values=${{ env.PROJECT_NAME }}" "Name=tag:Environment,Values=${{ env.ENVIRONMENT }}" \
+                  --query "Vpcs[0].VpcId" --output text 2>/dev/null || echo "None")
+                
+                if [ "$VPC_ID" != "None" ] && [ "$VPC_ID" != "null" ] && [ ! -z "$VPC_ID" ]; then
+                  # Force delete any remaining ENIs
+                  aws ec2 describe-network-interfaces \
+                    --filters "Name=vpc-id,Values=$VPC_ID" \
+                    --query "NetworkInterfaces[].NetworkInterfaceId" \
+                    --output text 2>/dev/null | xargs -n1 -I {} aws ec2 delete-network-interface --network-interface-id {} || true
+                  
+                  # Release any remaining EIPs
+                  aws ec2 describe-addresses \
+                    --filters "Name=domain,Values=vpc" \
+                    --query "Addresses[].AllocationId" \
+                    --output text 2>/dev/null | xargs -n1 -I {} aws ec2 release-address --allocation-id {} || true
+                fi
+              else
+                echo "❌ All network destruction attempts failed"
+                exit 1
+              fi
+            fi
+          done
 
       - name: Clean Up CloudWatch Resources
         id: cloudwatch_cleanup
@@ -478,16 +750,114 @@ jobs:
 
           # Delete CloudWatch Dashboard
           echo "🗑️ Deleting CloudWatch Dashboard..."
-          aws cloudwatch delete-dashboards --dashboard-names "vanillatstodo-dashboard" || true
+          DASHBOARD_NAME="${{ env.PROJECT_NAME }}-${{ env.ENVIRONMENT }}-${{ env.CLUSTER_NAME }}-dashboard"
+          if aws cloudwatch describe-dashboards --dashboard-names "$DASHBOARD_NAME" >/dev/null 2>&1; then
+            echo "   ✅ Found dashboard: $DASHBOARD_NAME"
+            aws cloudwatch delete-dashboards --dashboard-names "$DASHBOARD_NAME" || true
+            echo "   ✅ Dashboard deletion completed"
+          else
+            echo "   ℹ️ Dashboard not found: $DASHBOARD_NAME"
+          fi
 
           # Delete CloudWatch Alarms
           echo "🗑️ Deleting CloudWatch Alarms..."
-          ALARMS=$(aws cloudwatch describe-alarms --query "MetricAlarms[?contains(Tags[?Key=='Project'].Value, '${{ env.PROJECT_NAME }}') && contains(Tags[?Key=='Environment'].Value, '${{ env.ENVIRONMENT }}')].AlarmName" --output text)
-          if [ ! -z "$ALARMS" ]; then
-            for alarm in $ALARMS; do
-              aws cloudwatch delete-alarms --alarm-names $alarm
+
+          # First try to find alarms by tags (if they exist)
+          TAGGED_ALARMS=$(aws cloudwatch describe-alarms \
+            --query "MetricAlarms[?contains(Tags[?Key=='Project'].Value, '${{ env.PROJECT_NAME }}') && contains(Tags[?Key=='Environment'].Value, '${{ env.ENVIRONMENT }}')].AlarmName" \
+            --output text 2>/dev/null || echo "")
+
+          if [ ! -z "$TAGGED_ALARMS" ] && [ "$TAGGED_ALARMS" != "None" ]; then
+            echo "   ✅ Found tagged alarms: $TAGGED_ALARMS"
+            for alarm in $TAGGED_ALARMS; do
+              echo "   🗑️ Deleting alarm: $alarm"
+              aws cloudwatch delete-alarms --alarm-names "$alarm" || true
             done
           fi
+
+          # Also try to find alarms by name pattern (fallback)
+          PATTERN_ALARMS=$(aws cloudwatch describe-alarms \
+            --query "MetricAlarms[?contains(AlarmName, '${{ env.ENVIRONMENT }}-${{ env.PROJECT_NAME }}-${{ env.CLUSTER_NAME }}')].AlarmName" \
+            --output text 2>/dev/null || echo "")
+
+          if [ ! -z "$PATTERN_ALARMS" ] && [ "$PATTERN_ALARMS" != "None" ]; then
+            echo "   ✅ Found pattern-matched alarms: $PATTERN_ALARMS"
+            for alarm in $PATTERN_ALARMS; do
+              echo "   🗑️ Deleting alarm: $alarm"
+              aws cloudwatch delete-alarms --alarm-names "$alarm" || true
+            done
+          fi
+
+          if [ -z "$TAGGED_ALARMS" ] && [ -z "$PATTERN_ALARMS" ]; then
+            echo "   ℹ️ No CloudWatch alarms found"
+          fi
+
+      - name: Clean Up CloudWatch Log Groups
+        id: cloudwatch_logs_cleanup
+        run: |
+          echo "🔍 Cleaning up CloudWatch Log Groups..."
+
+          # List of log groups to clean up
+          LOG_GROUPS=(
+            "/aws/eks/vanillatstodo-cluster/cluster"
+            "/aws/vpc/staging-flow-logs"
+          )
+
+          # Also check for environment-specific flow logs
+          ENV_FLOW_LOGS="/aws/vpc/${{ env.ENVIRONMENT }}-flow-logs"
+          LOG_GROUPS+=("$ENV_FLOW_LOGS")
+
+          # Also check for any other log groups with our project name
+          PROJECT_LOG_GROUPS=$(aws logs describe-log-groups \
+            --query "logGroups[?contains(logGroupName, '${{ env.PROJECT_NAME }}')].logGroupName" \
+            --output text 2>/dev/null || echo "")
+
+          if [ ! -z "$PROJECT_LOG_GROUPS" ] && [ "$PROJECT_LOG_GROUPS" != "None" ]; then
+            echo "🔍 Found project-specific log groups: $PROJECT_LOG_GROUPS"
+            for log_group in $PROJECT_LOG_GROUPS; do
+              LOG_GROUPS+=("$log_group")
+            done
+          fi
+
+          # Remove duplicates and clean up each log group
+          UNIQUE_LOG_GROUPS=($(printf "%s\n" "${LOG_GROUPS[@]}" | sort -u))
+
+          for log_group in "${UNIQUE_LOG_GROUPS[@]}"; do
+            if [ ! -z "$log_group" ]; then
+              echo "🗑️ Checking log group: $log_group"
+              
+              # Check if log group exists
+              if aws logs describe-log-groups --log-group-name-prefix "$log_group" --query "logGroups[?logGroupName=='$log_group']" --output text | grep -q "$log_group"; then
+                echo "   ✅ Log group exists. Deleting..."
+                
+                # Delete all log streams first
+                echo "   🗑️ Deleting all log streams..."
+                STREAMS=$(aws logs describe-log-streams \
+                  --log-group-name "$log_group" \
+                  --query 'logStreams[*].logStreamName' \
+                  --output text 2>/dev/null || echo "")
+                
+                if [ ! -z "$STREAMS" ] && [ "$STREAMS" != "None" ]; then
+                  for stream in $STREAMS; do
+                    echo "     🗑️ Deleting stream: $stream"
+                    aws logs delete-log-stream --log-group-name "$log_group" --log-stream-name "$stream" || true
+                  done
+                fi
+                
+                # Delete the log group
+                echo "   🗑️ Deleting log group: $log_group"
+                if aws logs delete-log-group --log-group-name "$log_group"; then
+                  echo "   ✅ Successfully deleted log group: $log_group"
+                else
+                  echo "   ⚠️ Failed to delete log group: $log_group"
+                fi
+              else
+                echo "   ℹ️ Log group does not exist: $log_group"
+              fi
+            fi
+          done
+
+          echo "✅ CloudWatch Log Groups cleanup completed"
 
       - name: Clean Up Network Resources
         id: manual_network_cleanup
@@ -519,10 +889,10 @@ jobs:
             ["VPC"]=0
           )
 
-          # Clean up EIPs with staging-nat pattern
-          echo "🔍 Finding EIPs with staging-nat pattern..."
+          # Clean up EIPs with environment-project-nat pattern
+          echo "🔍 Finding EIPs with ${{ env.ENVIRONMENT }}-${{ env.PROJECT_NAME }}-nat pattern..."
           STAGING_EIPS=$(aws ec2 describe-addresses \
-            --filters "Name=tag:Name,Values=staging-nat-*" \
+            --filters "Name=tag:Name,Values=${{ env.ENVIRONMENT }}-${{ env.PROJECT_NAME }}-nat-*" \
             --query 'Addresses[*].AllocationId' \
             --output text || echo "")
 
@@ -545,7 +915,7 @@ jobs:
               fi
             done
           else
-            echo "   No staging NAT EIPs found"
+            echo "   No ${{ env.ENVIRONMENT }} NAT EIPs found"
           fi
 
           echo "🔍 Finding all VPCs with vanillatstodo tag..."
@@ -600,14 +970,27 @@ jobs:
             
             for eni in $ENI_IDS; do
               ((TOTAL_COUNT["INTERFACES"]++))
-              if aws ec2 describe-network-interfaces \
-                --network-interface-ids $eni \
-                --query 'NetworkInterfaces[0].Status' \
-                --output text | grep -q "available"; then
-                echo "   Deleting Network Interface: $eni"
-                if aws ec2 delete-network-interface --network-interface-id $eni; then
+              # Check if ENI still exists before checking status
+              if aws ec2 describe-network-interfaces --network-interface-ids $eni >/dev/null 2>&1; then
+                ENI_STATUS=$(aws ec2 describe-network-interfaces \
+                  --network-interface-ids $eni \
+                  --query 'NetworkInterfaces[0].Status' \
+                  --output text 2>/dev/null || echo "not-found")
+                
+                if [ "$ENI_STATUS" = "available" ]; then
+                  echo "   Deleting Network Interface: $eni"
+                  if aws ec2 delete-network-interface --network-interface-id $eni; then
+                    ((CLEANED_COUNT["INTERFACES"]++))
+                  fi
+                elif [ "$ENI_STATUS" = "not-found" ]; then
+                  echo "   ℹ️ Network Interface $eni already deleted"
                   ((CLEANED_COUNT["INTERFACES"]++))
+                else
+                  echo "   ⚠️ Network Interface $eni is not available (status: $ENI_STATUS)"
                 fi
+              else
+                echo "   ℹ️ Network Interface $eni no longer exists (already cleaned up)"
+                ((CLEANED_COUNT["INTERFACES"]++))
               fi
               sleep 2
             done
@@ -837,17 +1220,26 @@ jobs:
           echo "| Resource | Status | Details |" >> $GITHUB_STEP_SUMMARY
           echo "| -------- | ------ | ------- |" >> $GITHUB_STEP_SUMMARY
           echo "| EKS Cluster | ${EKS_STATUS:-❌} | Version: 1.31 |" >> $GITHUB_STEP_SUMMARY
-          echo "| CloudWatch | ${CLOUDWATCH_STATUS:-❌} | Monitoring |" >> $GITHUB_STEP_SUMMARY
+          echo "| K8s Resources | ${K8S_CLEANUP_STATUS:-❌} | LoadBalancers, PVCs, Ingresses |" >> $GITHUB_STEP_SUMMARY
 
-          # Network resources with cleanup details
+          # Monitoring status based on whether Terraform failed
+          if [ "${MONITORING_TERRAFORM_FAILED:-false}" = "true" ]; then
+            echo "| Monitoring | ⚠️ | Terraform failed, manual cleanup performed |" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "| Monitoring | ${MONITORING_STATUS:-✅} | CloudWatch resources |" >> $GITHUB_STEP_SUMMARY
+          fi
+
+          echo "| CloudWatch | ${CLOUDWATCH_STATUS:-❌} | Dashboards & Alarms |" >> $GITHUB_STEP_SUMMARY
+
+          # Network resources with cleanup details - using correct variable names
           echo "| Network - EIP | ${NETWORK_EIP_STATUS:-❌} | Cleaned: ${EIP_CLEANED:-0} of ${EIP_TOTAL:-0} |" >> $GITHUB_STEP_SUMMARY
           echo "| Network - VPC Endpoints | ${NETWORK_ENDPOINTS_STATUS:-❌} | Cleaned: ${ENDPOINTS_CLEANED:-0} of ${ENDPOINTS_TOTAL:-0} |" >> $GITHUB_STEP_SUMMARY
-          echo "| Network - NAT & EIP | ${NETWORK_NAT_STATUS:-❌} | Cleaned: ${NATS_CLEANED:-0} of ${NATS_TOTAL:-0} |" >> $GITHUB_STEP_SUMMARY
-          echo "| Network - Route Tables | ${NETWORK_ROUTE_STATUS:-❌} | Cleaned: ${ROUTES_CLEANED:-0} of ${ROUTES_TOTAL:-0} |" >> $GITHUB_STEP_SUMMARY
-          echo "| Network - NACLs | ${NETWORK_NACL_STATUS:-❌} | Cleaned: ${NACLS_CLEANED:-0} of ${NACLS_TOTAL:-0} |" >> $GITHUB_STEP_SUMMARY
-          echo "| Network - Subnets | ${NETWORK_SUBNET_STATUS:-❌} | Cleaned: ${SUBNETS_CLEANED:-0} of ${SUBNETS_TOTAL:-0} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Network - NAT Gateways | ${NETWORK_NAT_STATUS:-❌} | Cleaned: ${NAT_CLEANED:-0} of ${NAT_TOTAL:-0} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Network - Route Tables | ${NETWORK_ROUTE_TABLES_STATUS:-❌} | Cleaned: ${ROUTE_TABLES_CLEANED:-0} of ${ROUTE_TABLES_TOTAL:-0} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Network - NACLs | ${NETWORK_NACLS_STATUS:-❌} | Cleaned: ${NACLS_CLEANED:-0} of ${NACLS_TOTAL:-0} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Network - Subnets | ${NETWORK_SUBNETS_STATUS:-❌} | Cleaned: ${SUBNETS_CLEANED:-0} of ${SUBNETS_TOTAL:-0} |" >> $GITHUB_STEP_SUMMARY
           echo "| Network - IGW | ${NETWORK_IGW_STATUS:-❌} | Cleaned: ${IGW_CLEANED:-0} of ${IGW_TOTAL:-0} |" >> $GITHUB_STEP_SUMMARY
-          echo "| Network - VPCs | ${NETWORK_VPC_STATUS:-❌} | Cleaned: ${VPCS_CLEANED:-0} of ${VPCS_TOTAL:-0} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Network - VPCs | ${NETWORK_VPC_STATUS:-❌} | Cleaned: ${VPC_CLEANED:-0} of ${VPC_TOTAL:-0} |" >> $GITHUB_STEP_SUMMARY
           echo "| Network - Overall | ${NETWORK_STATUS:-❌} | Network Stack |" >> $GITHUB_STEP_SUMMARY
 
           echo "| S3 State | ${S3_STATUS:-❌} | Terraform State |" >> $GITHUB_STEP_SUMMARY
