@@ -21,9 +21,9 @@ permissions:
   packages: read
 
 env:
-  CLUSTER_NAME: ${{ github.event.client_payload.cluster_name || 'vanillatstodo-cluster' }}
-  AWS_REGION: "us-east-2"
-  DOCKER_IMAGE: "hftamayo/vanillatstodo:0.0.1"
+  CLUSTER_NAME: ${{ vars.CLUSTER_NAME || 'vanillatstodo-cluster' }}
+  AWS_REGION: ${{ vars.AWS_REGION || 'us-east-2' }}
+  APP_NAME: ${{ vars.APP_NAME || 'vanillatstodo' }}
   ENVIRONMENT: ${{ github.event.client_payload.environment || github.event.inputs.environment || 'experimental' }}
 
 jobs:
@@ -39,9 +39,12 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v3
 
-      - name: Load Environment Variables
+      - name: Set Dynamic Variables
         run: |
-          cat .github/variables/environment.env >> $GITHUB_ENV
+          # Use stable tag for testing (change this for production)
+          DOCKER_TAG="${{ vars.DOCKER_TAG || '0.0.1' }}"
+          echo "DOCKER_TAG=${DOCKER_TAG}" >> $GITHUB_ENV
+          echo "FULL_DOCKER_IMAGE=${{ vars.DOCKER_REPOSITORY || 'hftamayo/vanillatstodo' }}:${DOCKER_TAG}" >> $GITHUB_ENV
 
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
@@ -55,6 +58,11 @@ jobs:
           curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
           chmod +x kubectl
           sudo mv kubectl /usr/local/bin/
+
+      - name: Install Helm
+        uses: azure/setup-helm@v3
+        with:
+          version: "3.12.3"
 
       - name: Verify EKS Cluster
         run: |
@@ -89,16 +97,24 @@ jobs:
           kubectl get nodes -o wide || echo "❌ No nodes found!"
           echo ""
           echo "📊 Node Groups (AWS):"
-          aws eks describe-nodegroup --cluster-name ${{ env.CLUSTER_NAME }} --nodegroup-name workers || echo "❌ No nodegroup found!"
+          # List all nodegroups instead of hardcoding 'workers'
+          NODEGROUPS=$(aws eks list-nodegroups --cluster-name ${{ env.CLUSTER_NAME }} --query "nodegroups[0]" --output text 2>/dev/null || echo "")
+          if [ -n "$NODEGROUPS" ] && [ "$NODEGROUPS" != "None" ]; then
+            aws eks describe-nodegroup --cluster-name ${{ env.CLUSTER_NAME }} --nodegroup-name $NODEGROUPS || echo "❌ Nodegroup details unavailable!"
+          else
+            echo "❌ No nodegroups found!"
+          fi
           echo ""
 
       - name: Save Current Deployment
         run: |
-          if kubectl get deployment vanillatstodo &>/dev/null; then
-            echo "📦 Saving current deployment state..."
-            kubectl get deployment vanillatstodo -o yaml > previous_deployment.yaml
+          if helm status ${{ env.APP_NAME }}-${{ env.ENVIRONMENT }} &>/dev/null; then
+            echo "📦 Saving current Helm release state..."
+            helm get values ${{ env.APP_NAME }}-${{ env.ENVIRONMENT }} > previous_values.yaml
+            echo "PREVIOUS_RELEASE_EXISTS=true" >> $GITHUB_ENV
           else
-            echo "ℹ️ No existing deployment found"
+            echo "ℹ️ No existing Helm release found"
+            echo "PREVIOUS_RELEASE_EXISTS=false" >> $GITHUB_ENV
           fi
 
       - name: Create Docker Hub Secret
@@ -120,41 +136,60 @@ jobs:
       - name: Verify Docker Image
         run: |
           echo "🔍 Verifying Docker image..."
-          if ! docker pull ${{ env.DOCKER_IMAGE }}; then
+          echo "Docker image: ${{ env.FULL_DOCKER_IMAGE }}"
+          if ! docker pull ${{ env.FULL_DOCKER_IMAGE }}; then
             echo "❌ Docker image not found!"
             exit 1
           fi
           echo "✅ Docker image verified"
 
-      - name: Deploy to EKS
+      - name: Validate Helm Chart
         run: |
-          echo "🚀 Deploying application..."
-          kubectl apply -f devops/k8s/vanillatstodo_deployment.yml
-          kubectl apply -f devops/k8s/vanillatstodo_service.yml
+          echo "🔍 Validating Helm chart..."
+          helm lint ./devops/helm-chart
+          echo "✅ Helm chart validation passed"
+
+      - name: Deploy to EKS with Helm
+        run: |
+          echo "🚀 Deploying application with Helm..."
+          echo "Environment: ${{ env.ENVIRONMENT }}"
+          echo "Release name: ${{ env.APP_NAME }}-${{ env.ENVIRONMENT }}"
+          echo "Values file: ./devops/helm-chart/values-${{ env.ENVIRONMENT }}.yaml"
+          echo "Docker image: ${{ env.FULL_DOCKER_IMAGE }}"
+
+          helm upgrade --install ${{ env.APP_NAME }}-${{ env.ENVIRONMENT }} ./devops/helm-chart \
+            -f ./devops/helm-chart/values-${{ env.ENVIRONMENT }}.yaml \
+            --wait --timeout=600s \
+            --set app.name=${{ env.APP_NAME }} \
+            --set image.repository=${{ vars.DOCKER_REPOSITORY || 'hftamayo/vanillatstodo' }} \
+            --set image.tag=${{ env.DOCKER_TAG }} \
+            --set app.environment=${{ env.ENVIRONMENT }}
 
       - name: Wait for Deployment
         run: |
-          echo "⏳ Waiting for deployment rollout..."
-          if ! kubectl rollout status deployment/vanillatstodo --timeout=10m; then
+          echo "⏳ Waiting for Helm deployment to be ready..."
+
+          # Check deployment status
+          if ! kubectl rollout status deployment/${{ env.APP_NAME }} --timeout=10m; then
             echo "❌ Deployment failed!"
             echo ""
+            echo "🔍 Helm Release Status:"
+            helm status ${{ env.APP_NAME }}-${{ env.ENVIRONMENT }}
+            echo ""
             echo "🔍 Deployment Details:"
-            kubectl describe deployment/vanillatstodo
+            kubectl describe deployment/${{ env.APP_NAME }}
             echo ""
             echo "🔍 Pod Status:"
-            kubectl get pods -l app=vanillatstodo -o wide
+            kubectl get pods -l app=${{ env.APP_NAME }} -o wide
             echo ""
             echo "🔍 Pod Events:"
-            kubectl describe pods -l app=vanillatstodo
+            kubectl describe pods -l app=${{ env.APP_NAME }}
             echo ""
             echo "🔍 Container Logs:"
-            kubectl logs -l app=vanillatstodo --tail=100 --all-containers=true
+            kubectl logs -l app=${{ env.APP_NAME }} --tail=100 --all-containers=true
             echo ""
-            echo "🔍 Node Resources:"
-            kubectl top nodes || echo "Metrics not available"
-            echo ""
-            echo "🔍 Cluster Events:"
-            kubectl get events --sort-by=.metadata.creationTimestamp --tail=20
+            echo "🔍 Helm Release History:"
+            helm history ${{ env.APP_NAME }}-${{ env.ENVIRONMENT }}
             exit 1
           fi
 
@@ -163,7 +198,7 @@ jobs:
         run: |
           echo "⏳ Waiting for LoadBalancer..."
           for i in {1..20}; do
-            EXTERNAL_IP=$(kubectl get svc vanillatstodo -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
+            EXTERNAL_IP=$(kubectl get svc ${{ env.APP_NAME }} -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
             if [ -n "$EXTERNAL_IP" ]; then
               echo "SERVICE_URL=${EXTERNAL_IP}" >> $GITHUB_ENV
               echo "✅ Service URL: ${EXTERNAL_IP}"
@@ -188,25 +223,27 @@ jobs:
           done
 
       - name: Rollback on Failure
-        if: failure() && hashFiles('previous_deployment.yaml') != ''
+        if: failure() && env.PREVIOUS_RELEASE_EXISTS == 'true'
         run: |
-          echo "🔄 Rolling back deployment..."
-          kubectl apply -f previous_deployment.yaml
-          kubectl rollout status deployment/vanillatstodo --timeout=5m
+          echo "🔄 Rolling back Helm release..."
+          helm rollback ${{ env.APP_NAME }}-${{ env.ENVIRONMENT }} 0
+          kubectl rollout status deployment/${{ env.APP_NAME }} --timeout=5m
 
       - name: Deployment Summary
         if: always()
         run: |
-          echo "### Deployment Status 🚀" >> $GITHUB_STEP_SUMMARY
+          echo "### 🚀 Helm Deployment Status" >> $GITHUB_STEP_SUMMARY
           echo "| Component | Status | Details |" >> $GITHUB_STEP_SUMMARY
           echo "| --------- | ------ | ------- |" >> $GITHUB_STEP_SUMMARY
           echo "| Cluster | ${{ job.status }} | ${{ env.CLUSTER_NAME }} |" >> $GITHUB_STEP_SUMMARY
           echo "| Environment | ${{ env.ENVIRONMENT }} | ${{ env.AWS_REGION }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Release Name | ${{ env.APP_NAME }}-${{ env.ENVIRONMENT }} | Helm Release |" >> $GITHUB_STEP_SUMMARY
+          echo "| Values File | values-${{ env.ENVIRONMENT }}.yaml | Configuration |" >> $GITHUB_STEP_SUMMARY
           echo "| Service URL | ${{ env.SERVICE_URL || 'N/A' }} | LoadBalancer |" >> $GITHUB_STEP_SUMMARY
-          echo "| Image | ✅ | ${{ env.DOCKER_IMAGE }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| Cluster Endpoint | ${{ env.CLUSTER_ENDPOINT }} | API Server |" >> $GITHUB_STEP_SUMMARY
+          echo "| Image | ✅ | ${{ env.FULL_DOCKER_IMAGE }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Deployment Method | Helm | Security Enhanced |" >> $GITHUB_STEP_SUMMARY
           echo "| Health Check | ${{ steps.health_check.outputs.health_status || 'N/A' }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| Rollback Status | ${{ job.status == 'failure' && hashFiles('previous_deployment.yaml') != '' && 'Applied' || 'Not Required' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Rollback Status | ${{ job.status == 'failure' && env.PREVIOUS_RELEASE_EXISTS == 'true' && 'Applied' || 'Not Required' }} |" >> $GITHUB_STEP_SUMMARY
 
     # - name: Create Route 53 Record
     #   run: |
